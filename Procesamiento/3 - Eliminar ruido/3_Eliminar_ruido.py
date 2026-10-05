@@ -4,7 +4,6 @@ import argparse
 from collections import Counter
 import csv
 from dataclasses import dataclass
-import functools
 import hashlib
 import io
 import json
@@ -40,6 +39,11 @@ PASO_PROCESAMIENTO = "Paso 3: Eliminacion de ruido"
 CHECKPOINT_VERSION = 1
 CSV_BOM = b"\xef\xbb\xbf"
 CONTEXT_CHARACTERS = 180
+SQLITE_IN_CHUNK_SIZE = 500
+DEFAULT_SQLITE_CACHE_MB = 256
+DEFAULT_SQLITE_MMAP_MB = 1_024
+DEFAULT_HEARTBEAT_SECONDS = 30.0
+CSV_FIELD_SIZE_LIMIT = 2_147_483_647
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_INPUT_PATH = REPO_ROOT / "Base de datos" / "2 - Normalizacion" / "normalizado.jsonl"
@@ -103,6 +107,58 @@ class ApplyPaths:
     state_db: Path
 
 
+class ProgressReporter:
+    """Emite actividad periódica sin alterar el estado confirmado del checkpoint."""
+
+    def __init__(
+        self,
+        label: str,
+        *,
+        initial_value: int,
+        total_value: int | None,
+        every_seconds: float,
+        unit: str = "registros",
+    ) -> None:
+        self.label = label
+        self.initial_value = initial_value
+        self.total_value = total_value
+        self.every_seconds = every_seconds
+        self.unit = unit
+        self.started_at = time.perf_counter()
+        self.last_report_at = self.started_at
+
+    def report(self, value: int, *, force: bool = False, detail: str = "") -> None:
+        now = time.perf_counter()
+        if self.every_seconds <= 0:
+            return
+        if not force and now - self.last_report_at < self.every_seconds:
+            return
+        elapsed = max(now - self.started_at, 0.0)
+        processed = max(value - self.initial_value, 0)
+        rate = processed / elapsed if elapsed > 0 else 0.0
+        parts = [f"[ACTIVO] {self.label}: {value:,}"]
+        if self.total_value:
+            percentage = 100.0 * value / self.total_value
+            parts[-1] += f"/{self.total_value:,} ({percentage:.2f}%)"
+        if self.unit == "bytes":
+            parts.append(f"{rate / (1024 * 1024):.1f} MiB/s")
+        else:
+            parts.append(f"{rate:.1f} {self.unit}/s")
+        parts.append(f"{elapsed:.0f} s desde el inicio/reinicio")
+        if self.total_value and rate > 0 and value < self.total_value:
+            eta_seconds = (self.total_value - value) / rate
+            parts.append(f"ETA aproximada {eta_seconds / 3600:.1f} h")
+        if detail:
+            parts.append(detail)
+        print(" | ".join(parts), file=sys.stderr, flush=True)
+        self.last_report_at = now
+
+
+def allow_large_csv_fields() -> None:
+    """Permite releer candidatos cuyo fragmento supera el límite CSV estándar."""
+    csv.field_size_limit(CSV_FIELD_SIZE_LIMIT)
+
+
 def quick_fingerprint(path: Path) -> dict[str, int | str]:
     stat = path.stat()
     sample_size = 64 * 1024
@@ -120,11 +176,31 @@ def quick_fingerprint(path: Path) -> dict[str, int | str]:
     }
 
 
-def full_sha256(path: Path) -> str:
+def full_sha256(
+    path: Path,
+    *,
+    heartbeat_seconds: float = 0.0,
+    label: str = "Calculando SHA-256",
+) -> str:
     digest = hashlib.sha256()
+    total_bytes = path.stat().st_size
+    processed_bytes = 0
+    reporter = ProgressReporter(
+        label,
+        initial_value=0,
+        total_value=total_bytes,
+        every_seconds=heartbeat_seconds,
+        unit="bytes",
+    )
+    if heartbeat_seconds > 0:
+        reporter.report(0, force=True, detail=str(path))
     with path.open("rb") as input_file:
         while chunk := input_file.read(8 * 1024 * 1024):
             digest.update(chunk)
+            processed_bytes += len(chunk)
+            reporter.report(processed_bytes)
+    if heartbeat_seconds > 0:
+        reporter.report(processed_bytes, force=True, detail="completado")
     return digest.hexdigest()
 
 
@@ -275,14 +351,58 @@ def fsync_csv(binary_file: BinaryIO, text_file: io.TextIOWrapper) -> int:
     return offset
 
 
-def connect_sqlite(path: Path) -> sqlite3.Connection:
+def connect_sqlite(
+    path: Path,
+    *,
+    cache_mb: int = DEFAULT_SQLITE_CACHE_MB,
+    mmap_mb: int = DEFAULT_SQLITE_MMAP_MB,
+) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
-    connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("PRAGMA temp_store=MEMORY")
+    connection.execute(f"PRAGMA cache_size={-max(cache_mb, 1) * 1024}")
+    connection.execute(f"PRAGMA mmap_size={max(mmap_mb, 0) * 1024 * 1024}")
     connection.row_factory = sqlite3.Row
     return connection
+
+
+def _chunks(values: Sequence[str], size: int) -> Iterator[Sequence[str]]:
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def prefetch_global_block_stats(
+    connection: sqlite3.Connection,
+    block_hashes: Iterable[str],
+) -> dict[str, Mapping[str, object]]:
+    """Carga en pocas consultas las estadísticas requeridas por un lote."""
+    hashes = sorted(set(block_hashes))
+    result: dict[str, dict[str, object]] = {block_hash: {} for block_hash in hashes}
+    for chunk in _chunks(hashes, SQLITE_IN_CHUNK_SIZE):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = connection.execute(
+            f"SELECT * FROM block_stats WHERE block_hash IN ({placeholders})",
+            tuple(chunk),
+        ).fetchall()
+        for row in rows:
+            result[str(row["block_hash"])] = dict(row)
+
+    for chunk in _chunks(hashes, SQLITE_IN_CHUNK_SIZE):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = connection.execute(
+            "SELECT block_hash, origin, document_count "
+            f"FROM block_origins WHERE block_hash IN ({placeholders}) "
+            "ORDER BY block_hash, origin",
+            tuple(chunk),
+        ).fetchall()
+        for row in rows:
+            stats = result[str(row["block_hash"])]
+            origins = stats.setdefault("origin_counts", {})
+            assert isinstance(origins, dict)
+            origins[str(row["origin"])] = int(row["document_count"])
+    return result
 
 
 def initialize_audit_database(connection: sqlite3.Connection) -> None:
@@ -575,21 +695,41 @@ def write_balanced_sample(
     *,
     sample_size: int,
     seed: int,
+    heartbeat_seconds: float = 0.0,
+    total_rows: int | None = None,
 ) -> int:
+    allow_large_csv_fields()
     category_counts: Counter[str] = Counter()
+    count_reporter = ProgressReporter(
+        "Muestreo 1/2: contando categorias",
+        initial_value=0,
+        total_value=total_rows,
+        every_seconds=heartbeat_seconds,
+    )
+    count_reporter.report(0, force=True, detail="leyendo candidatos_ruido.csv")
     with input_csv.open("r", encoding="utf-8-sig", newline="") as input_file:
         reader = csv.DictReader(input_file)
-        for row in reader:
+        for row_number, row in enumerate(reader, start=1):
             category_counts[row["tipo_deteccion"]] += 1
+            count_reporter.report(row_number)
+    count_reporter.report(sum(category_counts.values()), force=True, detail="primera pasada completa")
     quotas = allocate_balanced_quotas(category_counts, sample_size)
     reservoirs: dict[str, list[dict[str, str]]] = {category: [] for category in quotas}
     seen: Counter[str] = Counter()
     randomizers = {
         category: random.Random(f"{seed}:{category}") for category in quotas
     }
+    select_reporter = ProgressReporter(
+        "Muestreo 2/2: seleccionando filas",
+        initial_value=0,
+        total_value=sum(category_counts.values()),
+        every_seconds=heartbeat_seconds,
+    )
+    select_reporter.report(0, force=True, detail="seleccion estratificada")
     with input_csv.open("r", encoding="utf-8-sig", newline="") as input_file:
         reader = csv.DictReader(input_file)
-        for row in reader:
+        for row_number, row in enumerate(reader, start=1):
+            select_reporter.report(row_number)
             category = row["tipo_deteccion"]
             quota = quotas.get(category, 0)
             if quota <= 0:
@@ -602,6 +742,9 @@ def write_balanced_sample(
                 selected = randomizers[category].randrange(seen[category])
                 if selected < quota:
                     reservoir[selected] = row
+    select_reporter.report(
+        sum(category_counts.values()), force=True, detail="segunda pasada completa"
+    )
     selected_rows = [
         row for category in sorted(reservoirs) for row in reservoirs[category]
     ]
@@ -684,6 +827,10 @@ def run_audit(
     progress_every: int,
     resume: bool,
     overwrite: bool,
+    heartbeat_seconds: float = 0.0,
+    sqlite_cache_mb: int = DEFAULT_SQLITE_CACHE_MB,
+    sqlite_mmap_mb: int = DEFAULT_SQLITE_MMAP_MB,
+    skip_sample: bool = False,
 ) -> dict[str, object]:
     thresholds.validate()
     detectors = build_detectors(disabled_detectors)
@@ -709,7 +856,13 @@ def run_audit(
             if not paths.summary_json.exists():
                 raise FileNotFoundError("El checkpoint esta completo pero falta el resumen.")
             with paths.summary_json.open("r", encoding="utf-8") as summary_file:
-                return json.load(summary_file)
+                completed_summary = json.load(summary_file)
+            if skip_sample or paths.sample_csv.exists() or review_sample_size == 0:
+                return completed_summary
+            # Una auditoria finalizada con --skip-sample puede generar la
+            # muestra mas adelante sin repetir indexacion ni deteccion.
+            state["phase"] = "sample"
+            state["completed"] = False
     else:
         existing = [path for path in targets if path.exists()]
         if existing and not overwrite:
@@ -746,12 +899,43 @@ def run_audit(
         }
         write_json_atomic(paths.checkpoint_json, state)
 
-    connection = connect_sqlite(paths.state_db)
+    if heartbeat_seconds > 0:
+        print(
+            f"[ACTIVO] Auditoria preparada | fase={state['phase']} | "
+            f"indexados={int(state['records_indexed']):,} | "
+            f"auditados={int(state['counters']['records_processed']):,} | "
+            f"lote={batch_size:,} registros/{max_batch_bytes / (1024 * 1024):.0f} MiB | "
+            f"latido={heartbeat_seconds:g} s",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(
+            f"[ACTIVO] Abriendo SQLite | cache={sqlite_cache_mb} MiB | "
+            f"mmap={sqlite_mmap_mb} MiB | {paths.state_db}",
+            file=sys.stderr,
+            flush=True,
+        )
+    connection = connect_sqlite(
+        paths.state_db,
+        cache_mb=sqlite_cache_mb,
+        mmap_mb=sqlite_mmap_mb,
+    )
     initialize_audit_database(connection)
+    if heartbeat_seconds > 0:
+        print("[ACTIVO] SQLite lista; iniciando trabajo.", file=sys.stderr, flush=True)
     try:
         if state["phase"] == "index":
             phase_started = time.perf_counter()
             previous_duration = float(state["durations"]["indexacion_global"])
+            index_reporter = ProgressReporter(
+                "Indexando registros",
+                initial_value=int(state["records_indexed"]),
+                total_value=None,
+                every_seconds=heartbeat_seconds,
+            )
+            index_reporter.report(
+                int(state["records_indexed"]), force=True, detail="inicio/reanudacion"
+            )
             with input_path.open("rb") as input_file:
                 input_file.seek(int(state["index_input_bytes"]))
                 records = iter_input_records(
@@ -764,6 +948,10 @@ def run_audit(
                         with connection:
                             for item in batch:
                                 index_record_blocks(connection, item)
+                                index_reporter.report(
+                                    item.record_number,
+                                    detail=f"leyendo byte {item.end_offset:,}",
+                                )
                     except (OSError, ValueError, sqlite3.Error):
                         state["counters"]["errors"] += 1
                         write_json_atomic(paths.checkpoint_json, state)
@@ -776,15 +964,20 @@ def run_audit(
                     )
                     write_json_atomic(paths.checkpoint_json, state)
                     if progress_every and batch[-1].record_number % progress_every < len(batch):
-                        print(
-                            f"Registros indexados: {batch[-1].record_number:,}",
-                            file=sys.stderr, flush=True,
+                        index_reporter.report(
+                            batch[-1].record_number,
+                            force=True,
+                            detail="checkpoint guardado",
                         )
             total_documents = connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
             if total_documents != int(state["records_indexed"]):
                 raise ValueError("La base SQLite global no coincide con el checkpoint.")
             fingerprint_started = time.perf_counter()
-            state["input_sha256"] = full_sha256(input_path)
+            state["input_sha256"] = full_sha256(
+                input_path,
+                heartbeat_seconds=heartbeat_seconds,
+                label="Calculando fingerprint completo",
+            )
             state["durations"]["fingerprint"] = time.perf_counter() - fingerprint_started
             state["phase"] = "detect"
             state["detect_input_bytes"] = 0
@@ -799,26 +992,24 @@ def run_audit(
             write_json_atomic(paths.checkpoint_json, state)
 
         if state["phase"] == "detect":
-            total_documents = connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-
-            @functools.lru_cache(maxsize=20_000)
-            def global_lookup(block_hash: str) -> Mapping[str, object]:
-                row = connection.execute(
-                    "SELECT * FROM block_stats WHERE block_hash = ?", (block_hash,)
-                ).fetchone()
-                if row is None:
-                    return {}
-                origins = connection.execute(
-                    "SELECT origin, document_count FROM block_origins WHERE block_hash = ? ORDER BY origin",
-                    (block_hash,),
-                ).fetchall()
-                return {
-                    **dict(row),
-                    "origin_counts": {origin["origin"]: origin["document_count"] for origin in origins},
-                }
+            # La fase de indexacion ya verifico este total antes de cambiar a
+            # "detect". Evitar COUNT(*) aqui elimina un escaneo redundante de
+            # una base de varios GiB cada vez que se usa --resume.
+            total_documents = int(state["records_indexed"])
 
             phase_started = time.perf_counter()
             previous_duration = float(state["durations"]["deteccion"])
+            detect_reporter = ProgressReporter(
+                "Auditando registros",
+                initial_value=int(state["counters"]["records_processed"]),
+                total_value=total_documents,
+                every_seconds=heartbeat_seconds,
+            )
+            detect_reporter.report(
+                int(state["counters"]["records_processed"]),
+                force=True,
+                detail="inicio/reanudacion",
+            )
             binary_file, text_file, writer = open_csv_writer(
                 paths.candidates_csv,
                 CSV_COLUMNS,
@@ -833,6 +1024,18 @@ def run_audit(
                         first_physical_line_number=int(state["detect_physical_lines"]) + 1,
                     )
                     for batch in iter_batches(records, batch_size, max_batch_bytes):
+                        batch_hashes = (
+                            normalized_block_hash(block.text)
+                            for item in batch
+                            for block in block_spans(str(item.record["texto"]))
+                        )
+                        batch_global_stats = prefetch_global_block_stats(
+                            connection, batch_hashes
+                        )
+
+                        def global_lookup(block_hash: str) -> Mapping[str, object]:
+                            return batch_global_stats.get(block_hash, {})
+
                         batch_rows: list[dict[str, object]] = []
                         batch_candidates: list[tuple[Mapping[str, object], list[ConsolidatedResult]]] = []
                         try:
@@ -861,6 +1064,13 @@ def run_audit(
                                     )
                                     for candidate in consolidated
                                 )
+                                detect_reporter.report(
+                                    item.record_number,
+                                    detail=(
+                                        f"lote en memoria; ultimo checkpoint "
+                                        f"{int(state['counters']['records_processed']):,}"
+                                    ),
+                                )
                         except (OSError, ValueError, sqlite3.Error):
                             state["counters"]["errors"] += 1
                             write_json_atomic(paths.checkpoint_json, state)
@@ -880,23 +1090,40 @@ def run_audit(
                         )
                         write_json_atomic(paths.checkpoint_json, state)
                         if progress_every and batch[-1].record_number % progress_every < len(batch):
-                            print(
-                                f"Registros auditados: {batch[-1].record_number:,}",
-                                file=sys.stderr, flush=True,
+                            detect_reporter.report(
+                                batch[-1].record_number,
+                                force=True,
+                                detail=(
+                                    f"checkpoint guardado; candidatos "
+                                    f"{int(state['counters']['total_candidates']):,}"
+                                ),
                             )
             finally:
                 text_file.close()
             state["phase"] = "sample"
             write_json_atomic(paths.checkpoint_json, state)
 
-        sample_started = time.perf_counter()
-        sample_count = write_balanced_sample(
-            paths.candidates_csv,
-            paths.sample_csv,
-            sample_size=review_sample_size,
-            seed=sampling_seed,
-        )
-        state["durations"]["muestreo"] = time.perf_counter() - sample_started
+        if skip_sample:
+            sample_count = 0
+            state["durations"]["muestreo"] = 0.0
+            if heartbeat_seconds > 0:
+                print(
+                    "[ACTIVO] Muestreo omitido por --skip-sample; "
+                    "se conserva candidatos_ruido.csv completo.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            sample_started = time.perf_counter()
+            sample_count = write_balanced_sample(
+                paths.candidates_csv,
+                paths.sample_csv,
+                sample_size=review_sample_size,
+                seed=sampling_seed,
+                heartbeat_seconds=heartbeat_seconds,
+                total_rows=int(state["counters"]["total_candidates"]),
+            )
+            state["durations"]["muestreo"] = time.perf_counter() - sample_started
         state["phase"] = "complete"
         state["completed"] = True
         summary = build_audit_summary(
@@ -945,6 +1172,7 @@ def import_review_csv(
     *,
     input_sha256: str,
 ) -> tuple[dict[str, int], dict[str, object]]:
+    allow_large_csv_fields()
     counts = {"pending": 0, "conservar": 0, "eliminar": 0, "total": 0}
     candidate_set = fresh_candidate_set_accumulator()
     with review_csv.open("r", encoding="utf-8-sig", newline="") as review_file:
@@ -1144,6 +1372,9 @@ def run_apply(
     progress_every: int,
     resume: bool,
     overwrite: bool,
+    heartbeat_seconds: float = 0.0,
+    sqlite_cache_mb: int = DEFAULT_SQLITE_CACHE_MB,
+    sqlite_mmap_mb: int = DEFAULT_SQLITE_MMAP_MB,
 ) -> dict[str, object]:
     if not review_csv.exists():
         raise FileNotFoundError(f"No existe el CSV revisado: {review_csv}")
@@ -1151,9 +1382,17 @@ def run_apply(
         raise ValueError("Use --resume o --overwrite, pero no ambos.")
 
     fingerprint_started = time.perf_counter()
-    input_sha256 = full_sha256(input_path)
+    input_sha256 = full_sha256(
+        input_path,
+        heartbeat_seconds=heartbeat_seconds,
+        label="Verificando SHA-256 de entrada",
+    )
     fingerprint_duration = time.perf_counter() - fingerprint_started
-    review_sha256 = full_sha256(review_csv)
+    review_sha256 = full_sha256(
+        review_csv,
+        heartbeat_seconds=heartbeat_seconds,
+        label="Verificando SHA-256 del CSV revisado",
+    )
     targets = [
         paths.output_jsonl, paths.applied_csv, paths.summary_json,
         paths.checkpoint_json, paths.state_db,
@@ -1188,7 +1427,18 @@ def run_apply(
                 if sidecar.exists():
                     sidecar.unlink()
 
-    connection = connect_sqlite(paths.state_db)
+    if heartbeat_seconds > 0:
+        print(
+            f"[ACTIVO] Abriendo SQLite de aplicacion | cache={sqlite_cache_mb} MiB | "
+            f"mmap={sqlite_mmap_mb} MiB | {paths.state_db}",
+            file=sys.stderr,
+            flush=True,
+        )
+    connection = connect_sqlite(
+        paths.state_db,
+        cache_mb=sqlite_cache_mb,
+        mmap_mb=sqlite_mmap_mb,
+    )
     initialize_application_database(connection)
     try:
         if not resume:
@@ -1229,6 +1479,15 @@ def run_apply(
 
         started = time.perf_counter()
         previous_elapsed = float(state["elapsed_seconds"])
+        apply_reporter = ProgressReporter(
+            "Aplicando decisiones",
+            initial_value=int(state["records_processed"]),
+            total_value=None,
+            every_seconds=heartbeat_seconds,
+        )
+        apply_reporter.report(
+            int(state["records_processed"]), force=True, detail="inicio/reanudacion"
+        )
         output_file = paths.output_jsonl.open("r+b")
         output_file.truncate(int(state["output_jsonl_bytes"]))
         output_file.seek(int(state["output_jsonl_bytes"]))
@@ -1254,6 +1513,13 @@ def run_apply(
                         for item in batch:
                             record = item.record
                             text = str(record["texto"])
+                            apply_reporter.report(
+                                item.record_number,
+                                detail=(
+                                    f"lote en memoria; ultimo checkpoint "
+                                    f"{int(state['records_processed']):,}"
+                                ),
+                            )
                             rows = connection.execute(
                                 "SELECT * FROM review_candidates WHERE record_number = ? ORDER BY start_offset, end_offset, candidate_id",
                                 (item.record_number,),
@@ -1343,9 +1609,10 @@ def run_apply(
                     )
                     write_json_atomic(paths.checkpoint_json, state)
                     if progress_every and batch[-1].record_number % progress_every < len(batch):
-                        print(
-                            f"Registros aplicados: {batch[-1].record_number:,}",
-                            file=sys.stderr, flush=True,
+                        apply_reporter.report(
+                            batch[-1].record_number,
+                            force=True,
+                            detail="checkpoint guardado",
                         )
         finally:
             output_file.close()
@@ -1458,6 +1725,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--review-csv", type=Path)
     parser.add_argument("--review-sample-size", type=int, default=110)
+    parser.add_argument(
+        "--skip-sample",
+        action="store_true",
+        help="Finaliza la auditoria sin crear muestra_revision_ruido.csv.",
+    )
     parser.add_argument("--sampling-seed", type=int, default=1729)
     parser.add_argument(
         "--disable-detector",
@@ -1469,6 +1741,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=200)
     parser.add_argument("--batch-max-mb", type=float, default=64.0)
     parser.add_argument("--progress-every", type=int, default=1_000)
+    parser.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=DEFAULT_HEARTBEAT_SECONDS,
+        help="Muestra actividad aunque el lote aun no haya guardado un checkpoint (0 lo desactiva).",
+    )
+    parser.add_argument(
+        "--sqlite-cache-mb",
+        type=int,
+        default=DEFAULT_SQLITE_CACHE_MB,
+        help="Cache de paginas SQLite en memoria.",
+    )
+    parser.add_argument(
+        "--sqlite-mmap-mb",
+        type=int,
+        default=DEFAULT_SQLITE_MMAP_MB,
+        help="Tamano maximo del mapeo de lectura SQLite (0 lo desactiva).",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     threshold_arguments(parser)
@@ -1485,8 +1775,18 @@ def main() -> int:
     if args.batch_size <= 0 or args.batch_max_mb <= 0:
         print("Los limites de lote deben ser mayores que 0.", file=sys.stderr)
         return 1
-    if args.progress_every < 0 or args.review_sample_size < 0:
-        print("El progreso y el tamano de muestra no pueden ser negativos.", file=sys.stderr)
+    if (
+        args.progress_every < 0
+        or args.review_sample_size < 0
+        or args.heartbeat_seconds < 0
+        or args.sqlite_cache_mb <= 0
+        or args.sqlite_mmap_mb < 0
+    ):
+        print(
+            "Los parametros de progreso, muestra y memoria deben ser no negativos; "
+            "--sqlite-cache-mb debe ser mayor que 0.",
+            file=sys.stderr,
+        )
         return 1
     max_batch_bytes = max(1, int(args.batch_max_mb * 1024 * 1024))
 
@@ -1513,14 +1813,23 @@ def main() -> int:
                 progress_every=args.progress_every,
                 resume=args.resume,
                 overwrite=args.overwrite,
+                heartbeat_seconds=args.heartbeat_seconds,
+                sqlite_cache_mb=args.sqlite_cache_mb,
+                sqlite_mmap_mb=args.sqlite_mmap_mb,
+                skip_sample=args.skip_sample,
             )
             print("Auditoria de ruido terminada; no se elimino contenido.")
             print(f"Registros procesados: {summary['total_registros_procesados']:,}")
             print(f"Candidatos: {summary['total_candidatos']:,}")
             print(f"CSV completo: {paths.candidates_csv}")
-            print(f"Muestra: {paths.sample_csv}")
+            if args.skip_sample:
+                print("Muestra: omitida por --skip-sample")
+            else:
+                print(f"Muestra: {paths.sample_csv}")
             print(f"Resumen: {paths.summary_json}")
         else:
+            if args.skip_sample:
+                raise ValueError("--skip-sample solo se usa con --mode audit.")
             review_csv = (
                 args.review_csv.resolve()
                 if args.review_csv
@@ -1542,6 +1851,9 @@ def main() -> int:
                 progress_every=args.progress_every,
                 resume=args.resume,
                 overwrite=args.overwrite,
+                heartbeat_seconds=args.heartbeat_seconds,
+                sqlite_cache_mb=args.sqlite_cache_mb,
+                sqlite_mmap_mb=args.sqlite_mmap_mb,
             )
             print("Aplicacion de decisiones terminada.")
             print(f"Registros escritos: {summary['registros_escritos']:,}")
@@ -1552,7 +1864,14 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nProceso interrumpido. Use --resume para continuar.", file=sys.stderr)
         return 130
-    except (FileExistsError, FileNotFoundError, OSError, ValueError, sqlite3.Error) as error:
+    except (
+        FileExistsError,
+        FileNotFoundError,
+        OSError,
+        ValueError,
+        csv.Error,
+        sqlite3.Error,
+    ) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
     return 0

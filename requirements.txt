@@ -1,0 +1,6 @@
+# Hugging Face CLI, Jobs y Storage Buckets.
+# Los montajes de buckets en Jobs requieren huggingface_hub >= 1.8.
+huggingface_hub>=1.8,<2
+
+# Interfaz de revisión humana del paso 3.
+streamlit>=1.45,<2

@@ -3,6 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+import functools
 import hashlib
 import json
 import re
@@ -157,8 +158,9 @@ def line_spans(text: str) -> list[Span]:
     return spans
 
 
-def block_spans(text: str) -> list[Span]:
-    """Devuelve bloques no vacíos separados por una o más líneas vacías."""
+@functools.lru_cache(maxsize=2)
+def _cached_block_spans(text: str) -> tuple[Span, ...]:
+    """Conserva solo los textos recientes usados por varios detectores seguidos."""
     spans: list[Span] = []
     cursor = 0
     for separator in re.finditer(r"\n[ \t]*\n+", text):
@@ -174,7 +176,12 @@ def block_spans(text: str) -> list[Span]:
     right = len(raw.rstrip())
     if right > left:
         spans.append(Span(cursor + left, cursor + right, raw[left:right]))
-    return spans
+    return tuple(spans)
+
+
+def block_spans(text: str) -> list[Span]:
+    """Devuelve bloques no vacíos separados por una o más líneas vacías."""
+    return list(_cached_block_spans(text))
 
 
 def position_ratio(start: int, text_length: int) -> float:

@@ -168,6 +168,121 @@ class SamplingAndWorkflowTests(unittest.TestCase):
         self.assertEqual(quotas["C"], 1)
         self.assertEqual(quotas["B"], 2)
 
+    def test_global_stats_are_prefetched_for_a_batch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            connection = workflow.connect_sqlite(Path(temporary) / "audit.sqlite3")
+            workflow.initialize_audit_database(connection)
+            try:
+                with connection:
+                    connection.execute(
+                        """
+                        INSERT INTO block_stats(
+                            block_hash, document_count, start_count, end_count,
+                            middle_count, character_count, word_count, sample
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        ("hash-a", 8, 5, 3, 0, 20, 4, "muestra"),
+                    )
+                    connection.executemany(
+                        "INSERT INTO block_origins(block_hash, origin, document_count) "
+                        "VALUES (?, ?, ?)",
+                        [("hash-a", "A", 5), ("hash-a", "B", 3)],
+                    )
+                stats = workflow.prefetch_global_block_stats(
+                    connection, ["hash-missing", "hash-a", "hash-a"]
+                )
+                self.assertEqual(stats["hash-a"]["document_count"], 8)
+                self.assertEqual(stats["hash-a"]["origin_counts"], {"A": 5, "B": 3})
+                self.assertEqual(stats["hash-missing"], {})
+            finally:
+                connection.close()
+
+    def test_balanced_sample_accepts_fields_larger_than_csv_default(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_csv = root / "candidatos.csv"
+            output_csv = root / "muestra.csv"
+            row = {column: "" for column in workflow.CSV_COLUMNS}
+            row.update(
+                {
+                    "candidate_id": "large-candidate",
+                    "tipo_deteccion": "TEST_LARGE_FIELD",
+                    "texto_detectado": "x" * 150_000,
+                }
+            )
+            with input_csv.open("w", encoding="utf-8-sig", newline="") as output:
+                writer = csv.DictWriter(
+                    output, fieldnames=workflow.CSV_COLUMNS, lineterminator="\n"
+                )
+                writer.writeheader()
+                writer.writerow(row)
+
+            sample_count = workflow.write_balanced_sample(
+                input_csv, output_csv, sample_size=1, seed=7
+            )
+            self.assertEqual(sample_count, 1)
+            with output_csv.open("r", encoding="utf-8-sig", newline="") as sample:
+                sampled = next(csv.DictReader(sample))
+            self.assertEqual(len(sampled["texto_detectado"]), 150_000)
+
+    def test_audit_can_finish_without_optional_sample(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_path = root / "normalizado.jsonl"
+            input_path.write_text(
+                json.dumps(
+                    {
+                        "id": "r1",
+                        "texto": "Texto clinico conservado.",
+                        "base_de_datos_origen": "A",
+                        "archivo_origen": "a.txt",
+                        "ruta_relativa_origen": "a.txt",
+                        "procesamiento": ["Paso 1", "Paso 2: Normalizacion"],
+                    }
+                ) + "\n",
+                encoding="utf-8",
+            )
+            output_dir = root / "salida"
+            paths = workflow.AuditPaths(
+                candidates_csv=output_dir / "candidatos_ruido.csv",
+                sample_csv=output_dir / "muestra_revision_ruido.csv",
+                summary_json=output_dir / "auditoria_resumen.json",
+                checkpoint_json=output_dir / "auditoria.checkpoint.json",
+                state_db=output_dir / "auditoria_global.sqlite3",
+            )
+            summary = workflow.run_audit(
+                input_path=input_path,
+                paths=paths,
+                thresholds=core.Thresholds(),
+                disabled_detectors=(),
+                review_sample_size=110,
+                sampling_seed=7,
+                batch_size=1,
+                max_batch_bytes=4096,
+                progress_every=0,
+                resume=False,
+                overwrite=False,
+                skip_sample=True,
+            )
+            self.assertTrue(paths.summary_json.exists())
+            self.assertFalse(paths.sample_csv.exists())
+            self.assertEqual(summary["tamano_muestra_generado"], 0)
+            workflow.run_audit(
+                input_path=input_path,
+                paths=paths,
+                thresholds=core.Thresholds(),
+                disabled_detectors=(),
+                review_sample_size=110,
+                sampling_seed=7,
+                batch_size=1,
+                max_batch_bytes=4096,
+                progress_every=0,
+                resume=True,
+                overwrite=False,
+                skip_sample=False,
+            )
+            self.assertTrue(paths.sample_csv.exists())
+
     def test_audit_then_apply_only_explicit_deletion(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
